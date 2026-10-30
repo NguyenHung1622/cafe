@@ -6,25 +6,28 @@ import re
 import secrets
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal
 
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pymongo import ReturnDocument, UpdateOne
-from pymongo.errors import DuplicateKeyError, WriteError
+from pymongo.errors import BulkWriteError, DuplicateKeyError, WriteError
+
+from report_xlsx import build_workbook
 
 import db as database
-from db import categories, customers, menu, orders, slugify
+from db import categories, customers, menu, orders, slugify, tables
 
 ADMIN_KEY = os.getenv("ADMIN_KEY", "admin123")
 SHIPPING_FEE = 15000
 FREE_SHIP_FROM = 150000
-TABLES = 20
+VN = timezone(timedelta(hours=7))   # giờ Việt Nam (không có giờ mùa hè)
+TABLE_LABEL = {"free": "Trống", "occupied": "Có khách", "reserved": "Đã đặt trước", "disabled": "Tạm ngưng"}
 FLOW = {  # luồng trạng thái hợp lệ của đơn hàng
     "pending": ["preparing", "cancelled"],
     "preparing": ["ready", "cancelled"],
@@ -85,11 +88,24 @@ class CustomerIn(BaseModel):
 class OrderIn(BaseModel):
     customer: CustomerIn
     type: Literal["dine_in", "takeaway", "delivery"]
-    tableNumber: int | None = Field(None, ge=1, le=TABLES)
+    tableNumber: int | None = Field(None, ge=1, le=999)
     address: str | None = Field(None, max_length=200)
     paymentMethod: Literal["cash", "transfer", "momo"] = "cash"
     items: list[CartLine] = Field(min_length=1, max_length=30)
     note: str = Field("", max_length=300)
+
+
+class TableCreate(BaseModel):
+    number: int | None = Field(None, ge=1, le=999)   # bỏ trống = tự đánh số tiếp theo
+    count: int = Field(1, ge=1, le=50)               # thêm nhiều bàn liên tiếp một lúc
+    seats: int = Field(4, ge=1, le=50)
+    area: str = Field("Tầng 1", min_length=1, max_length=40)
+
+
+class TableUpdate(BaseModel):
+    seats: int = Field(ge=1, le=50)
+    area: str = Field(min_length=1, max_length=40)
+    status: Literal["free", "occupied", "reserved", "disabled"]
 
 
 class ReviewIn(BaseModel):
@@ -132,12 +148,17 @@ def home():
 
 @app.get("/api/config")
 def config():
-    return {"shippingFee": SHIPPING_FEE, "freeShipFrom": FREE_SHIP_FROM, "tables": TABLES}
+    return {"shippingFee": SHIPPING_FEE, "freeShipFrom": FREE_SHIP_FROM}
 
 
 @app.get("/api/categories")
 def list_categories():
     return clean(list(categories.find().sort("order", 1)))
+
+
+@app.get("/api/tables")
+def public_tables():
+    return clean(list(tables.find({}, {"_id": 0, "number": 1, "seats": 1, "area": 1, "status": 1}).sort("number", 1)))
 
 
 # ===================== Thực đơn (khách hàng) =====================
@@ -226,7 +247,16 @@ def place_order(o: OrderIn):
         raise HTTPException(400, "Vui lòng nhập địa chỉ giao hàng")
 
     taken = []  # (sku, qty) đã trừ kho - hoàn lại nếu bước sau thất bại
+    table_taken = None
     try:
+        if o.type == "dine_in":
+            # Chiếm bàn bằng 1 thao tác nguyên tử: chỉ khớp khi bàn đang "free" -> 2 khách không thể ngồi cùng 1 bàn
+            r = tables.update_one({"number": o.tableNumber, "status": "free"}, {"$set": {"status": "occupied"}})
+            if r.modified_count == 0:
+                t = tables.find_one({"number": o.tableNumber})
+                raise HTTPException(409, f"Bàn {o.tableNumber} không tồn tại" if not t else
+                                    f"Bàn {o.tableNumber} hiện không trống ({TABLE_LABEL[t['status']].lower()})")
+            table_taken = o.tableNumber
         lines, subtotal = [], 0
         for it in o.items:
             item = menu.find_one({"variants.sku": it.sku, "available": True}, {"reviews": 0})
@@ -286,6 +316,8 @@ def place_order(o: OrderIn):
         return doc
     except Exception:
         restore_stock(taken)
+        if table_taken:
+            tables.update_one({"number": table_taken, "status": "occupied"}, {"$set": {"status": "free"}})
         raise
 
 
@@ -369,6 +401,8 @@ def update_status(code: str, body: StatusIn):
     if body.status == "cancelled":
         restore_stock([(l["sku"], l["qty"]) for l in upd["items"] if l.get("tracked")])
         adjust_sold(upd["items"], -1)
+    if body.status in ("completed", "cancelled") and upd["type"] == "dine_in" and upd.get("tableNumber"):
+        tables.update_one({"number": upd["tableNumber"], "status": "occupied"}, {"$set": {"status": "free"}})
     if body.status == "completed":
         customers.update_one({"_id": upd["customerId"]}, {"$inc": {"points": upd["total"] // 10000}})
     return clean(upd)
@@ -436,3 +470,160 @@ def admin_delete_item(slug: str):
     if menu.delete_one({"slug": slug}).deleted_count == 0:
         raise HTTPException(404, "Không tìm thấy món")
     return {"ok": True}
+
+
+# ===================== Quản lý bàn =====================
+ACTIVE = ["pending", "preparing", "ready"]
+
+
+@app.get("/api/admin/tables", dependencies=[Depends(require_admin)])
+def admin_tables():
+    rows = list(tables.aggregate([
+        {"$sort": {"number": 1}},
+        # $lookup có pipeline: lấy đơn dùng tại quán đang phục vụ của từng bàn
+        {"$lookup": {"from": "orders", "let": {"n": "$number"}, "pipeline": [
+            {"$match": {"$expr": {"$and": [{"$eq": ["$tableNumber", "$$n"]}, {"$eq": ["$type", "dine_in"]},
+                                           {"$in": ["$status", ACTIVE]}]}}},
+            {"$sort": {"createdAt": -1}}, {"$limit": 1},
+            {"$project": {"_id": 0, "code": 1, "total": 1, "status": 1, "createdAt": 1}}], "as": "current"}},
+        {"$addFields": {"current": {"$arrayElemAt": ["$current", 0]}}},
+    ]))
+    return clean(rows)
+
+
+@app.post("/api/admin/tables", status_code=201, dependencies=[Depends(require_admin)])
+def admin_add_tables(body: TableCreate):
+    if body.number is None:
+        last = tables.find_one(sort=[("number", -1)])
+        start = (last["number"] + 1) if last else 1
+    else:
+        start = body.number
+    nums = list(range(start, start + body.count))
+    if nums[-1] > 999:
+        raise HTTPException(400, "Số bàn tối đa là 999")
+    dup = [t["number"] for t in tables.find({"number": {"$in": nums}}, {"number": 1})]
+    if dup:
+        raise HTTPException(409, "Bàn đã tồn tại: " + ", ".join(map(str, sorted(dup))))
+    now = now_utc()
+    try:
+        tables.insert_many([{"number": n, "name": f"Bàn {n}", "seats": body.seats, "area": body.area.strip(),
+                             "status": "free", "createdAt": now} for n in nums], ordered=False)
+    except BulkWriteError:
+        raise HTTPException(409, "Số bàn bị trùng, hãy thử lại")
+    return {"added": nums}
+
+
+@app.put("/api/admin/tables/{number}", dependencies=[Depends(require_admin)])
+def admin_update_table(number: int, body: TableUpdate):
+    t = tables.find_one({"number": number})
+    if not t:
+        raise HTTPException(404, "Không tìm thấy bàn")
+    if body.status == "occupied" and t["status"] != "occupied":
+        raise HTTPException(409, "Trạng thái “Có khách” tự động đặt khi khách gọi món tại bàn")
+    if t["status"] == "occupied" and body.status != "occupied":
+        raise HTTPException(409, "Bàn đang có khách, hãy hoàn tất hoặc hủy đơn của bàn để giải phóng")
+    tables.update_one({"number": number}, {"$set": {"seats": body.seats, "area": body.area.strip(), "status": body.status}})
+    return {"ok": True}
+
+
+@app.delete("/api/admin/tables/{number}", dependencies=[Depends(require_admin)])
+def admin_delete_table(number: int):
+    t = tables.find_one({"number": number})
+    if not t:
+        raise HTTPException(404, "Không tìm thấy bàn")
+    if t["status"] == "occupied":
+        raise HTTPException(409, "Bàn đang có khách, không thể xóa")
+    tables.delete_one({"number": number})   # đơn cũ vẫn giữ nguyên số bàn (bản chụp)
+    return {"ok": True}
+
+
+# ===================== Báo cáo tuần / tháng =====================
+WEEKDAYS = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"]
+
+
+def local_start(d: date) -> datetime:
+    """00:00 giờ Việt Nam của ngày d, đổi sang UTC để truy vấn."""
+    return datetime.combine(d, time.min, tzinfo=VN).astimezone(timezone.utc)
+
+
+def period_bounds(period: str, d: date):
+    if period == "week":                                    # thứ Hai -> Chủ nhật
+        start = d - timedelta(days=d.weekday())
+        end = start + timedelta(days=6)
+        prev_end = start - timedelta(days=1)
+        prev_start = prev_end - timedelta(days=6)
+        label = f"Tuần {start:%d/%m/%Y} – {end:%d/%m/%Y}"
+        prev_label = f"Tuần {prev_start:%d/%m} – {prev_end:%d/%m/%Y}"
+    else:                                                   # cả tháng chứa ngày d
+        start = d.replace(day=1)
+        end = (start + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        prev_end = start - timedelta(days=1)
+        prev_start = prev_end.replace(day=1)
+        label = f"Tháng {start:%m/%Y}"
+        prev_label = f"Tháng {prev_start:%m/%Y}"
+    return start, end, prev_start, prev_end, label, prev_label
+
+
+def build_report(period: str, d: date, with_orders=False):
+    start, end, p_start, p_end, label, prev_label = period_bounds(period, d)
+    lo, hi = local_start(start), local_start(end + timedelta(days=1))
+    rng = {"createdAt": {"$gte": lo, "$lt": hi}}
+    nc = {"status": {"$ne": "cancelled"}}
+    line_rev = {"$sum": {"$multiply": ["$items.price", "$items.qty"]}}
+    f = orders.aggregate([{"$match": rng}, {"$facet": {
+        "summary": [{"$match": nc}, {"$group": {"_id": None, "orders": {"$sum": 1}, "revenue": {"$sum": "$total"},
+                                                "customers": {"$addToSet": "$customerId"}}},
+                    {"$project": {"_id": 0, "orders": 1, "revenue": 1, "customers": {"$size": "$customers"}}}],
+        "cancelled": [{"$match": {"status": "cancelled"}}, {"$count": "n"}],
+        "qty": [{"$match": nc}, {"$unwind": "$items"}, {"$group": {"_id": None, "qty": {"$sum": "$items.qty"}}}],
+        "byDay": [{"$match": nc}, {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$createdAt", "timezone": "+07:00"}},
+                                              "orders": {"$sum": 1}, "revenue": {"$sum": "$total"}}}],
+        "byCategory": [{"$match": nc}, {"$unwind": "$items"},
+                       {"$group": {"_id": "$items.category", "qty": {"$sum": "$items.qty"}, "revenue": line_rev}},
+                       {"$sort": {"revenue": -1}}],
+        "topItems": [{"$match": nc}, {"$unwind": "$items"},
+                     {"$group": {"_id": "$items.name", "qty": {"$sum": "$items.qty"}, "revenue": line_rev}},
+                     {"$sort": {"qty": -1, "revenue": -1}}, {"$limit": 10}],
+        "byType": [{"$match": nc}, {"$group": {"_id": "$type", "orders": {"$sum": 1}, "revenue": {"$sum": "$total"}}}, {"$sort": {"revenue": -1}}],
+        "byPayment": [{"$match": nc}, {"$group": {"_id": "$paymentMethod", "orders": {"$sum": 1}, "revenue": {"$sum": "$total"}}}, {"$sort": {"revenue": -1}}],
+    }}]).next()
+    prev = list(orders.aggregate([
+        {"$match": {"createdAt": {"$gte": local_start(p_start), "$lt": local_start(p_end + timedelta(days=1))}, **nc}},
+        {"$group": {"_id": None, "orders": {"$sum": 1}, "revenue": {"$sum": "$total"}}}]))
+    s = f["summary"][0] if f["summary"] else {"orders": 0, "revenue": 0, "customers": 0}
+    s["avg"] = round(s["revenue"] / s["orders"]) if s["orders"] else 0
+    s["cancelled"] = f["cancelled"][0]["n"] if f["cancelled"] else 0
+    s["itemsQty"] = f["qty"][0]["qty"] if f["qty"] else 0
+    by_day_map = {x["_id"]: x for x in f["byDay"]}
+    by_day = []
+    for i in range((end - start).days + 1):                 # điền đủ các ngày, ngày không bán = 0
+        day = start + timedelta(days=i)
+        x = by_day_map.get(day.isoformat(), {})
+        by_day.append({"date": f"{day:%d/%m/%Y}", "weekday": WEEKDAYS[day.weekday()],
+                       "orders": x.get("orders", 0), "revenue": x.get("revenue", 0)})
+    rep = {
+        "period": {"type": period, "label": label, "start": start.isoformat(), "end": end.isoformat(),
+                   "filename": f"bao-cao-{'tuan' if period == 'week' else 'thang'}-{start.isoformat()}_{end.isoformat()}"},
+        "summary": s, "prev": {"label": prev_label, **(prev[0] if prev else {"orders": 0, "revenue": 0}), "_id": None},
+        "byDay": by_day, "byCategory": f["byCategory"], "topItems": f["topItems"],
+        "byType": f["byType"], "byPayment": f["byPayment"],
+    }
+    rep["prev"].pop("_id")
+    if with_orders:
+        rep["orders"] = list(orders.find(rng).sort("createdAt", 1).limit(5000))
+    return rep
+
+
+@app.get("/api/admin/report", dependencies=[Depends(require_admin)])
+def admin_report(period: Literal["week", "month"] = "week", date_: str = Query("", alias="date"),
+                 format: Literal["json", "xlsx"] = "json"):
+    try:
+        d = date.fromisoformat(date_) if date_ else datetime.now(VN).date()
+    except ValueError:
+        raise HTTPException(400, "Ngày không hợp lệ (định dạng YYYY-MM-DD)")
+    if format == "xlsx":
+        rep = build_report(period, d, with_orders=True)
+        data = build_workbook(rep, categories={c["_id"]: c["name"] for c in categories.find()})
+        return Response(data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={"Content-Disposition": f'attachment; filename="{rep["period"]["filename"]}.xlsx"'})
+    return clean(build_report(period, d))

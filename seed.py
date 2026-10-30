@@ -1,11 +1,11 @@
-"""Nạp dữ liệu mẫu: 5 nhóm, 27 món, 6 khách hàng, ~300 đơn hàng 30 ngày gần nhất.
+"""Nạp dữ liệu mẫu: 5 nhóm, 27 món, 14 bàn, 6 khách hàng, ~300 đơn hàng 30 ngày gần nhất.
 Chạy:  python seed.py      (xóa dữ liệu cũ của database trong DB_NAME rồi nạp lại)
 """
 import random
 from datetime import datetime, timedelta, timezone
 
 import db as database
-from db import categories, customers, menu, orders, slugify
+from db import categories, customers, menu, orders, slugify, tables
 
 CATS = [  # _id dạng chuỗi dễ đọc (tham chiếu từ menu_items.category)
     ("ca-phe", "Cà phê", "#6f4e37", 1),
@@ -59,6 +59,11 @@ BAKERY = [
     ("Bông lan trứng muối", "banh", "Bông lan mềm, sốt trứng muối.", [("Phần", 39000, 10)]),
     ("Bánh flan caramel", "banh", "Flan mịn, caramel đắng nhẹ.", [("Hũ", 22000, 12)]),
 ]
+# (số bàn, số chỗ, khu vực)
+TABLES = [(1, 2, "Tầng 1"), (2, 2, "Tầng 1"), (3, 4, "Tầng 1"), (4, 4, "Tầng 1"), (5, 4, "Tầng 1"), (6, 6, "Tầng 1"),
+          (7, 4, "Tầng 2"), (8, 4, "Tầng 2"), (9, 6, "Tầng 2"), (10, 6, "Tầng 2"),
+          (11, 4, "Sân vườn"), (12, 4, "Sân vườn"), (13, 6, "Sân vườn"), (14, 8, "Sân vườn")]
+RESERVED, DISABLED = 10, 14      # bàn đặt trước / tạm ngưng để minh họa
 NAMES = ["Nguyễn Văn An", "Trần Thị Bình", "Lê Minh Cường", "Phạm Thanh Dung", "Hoàng Quốc Huy", "Võ Thị Lan"]
 PHONES = ["0901234501", "0901234502", "0901234503", "0901234504", "0901234505", "0901234506"]
 COMMENTS = ["Rất ngon, sẽ quay lại!", "Vị vừa miệng, phục vụ nhanh.", "Hơi ngọt với mình nhưng ổn.",
@@ -96,6 +101,12 @@ def run(n_orders=300, quiet=False):
     menu.insert_many(items)
     items = list(menu.find())
 
+    tables.insert_many([{"number": n, "name": f"Bàn {n}", "seats": s, "area": a,
+                         "status": "reserved" if n == RESERVED else "disabled" if n == DISABLED else "free",
+                         "createdAt": now - timedelta(days=60)} for n, s, a in TABLES])
+    pool = [n for n, _, _ in TABLES if n not in (RESERVED, DISABLED)]
+    used = set()      # bàn đang có khách (đơn dùng tại quán chưa hoàn tất)
+
     custs = [{"name": n, "phone": p, "points": 0, "addresses": ["12 Nguyễn Huệ, Quận 1, TP.HCM"],
               "createdAt": now - timedelta(days=40)} for n, p in zip(NAMES, PHONES)]
     ids = customers.insert_many(custs).inserted_ids
@@ -118,11 +129,17 @@ def run(n_orders=300, quiet=False):
             subtotal += unit * qty
         typ = random.choice(["dine_in", "dine_in", "takeaway", "delivery"])
         ship = 15000 if typ == "delivery" and subtotal < 150000 else 0
+        tbl = random.choice(pool) if typ == "dine_in" else None
         age_h = (now - created).total_seconds() / 3600
         if age_h > 24:
             final = random.choices(["completed", "cancelled"], [92, 8])[0]
         else:
             final = random.choice(["pending", "preparing", "ready", "completed"])
+        if typ == "dine_in" and final in ("pending", "preparing", "ready"):
+            if tbl in used:                 # mỗi bàn chỉ có 1 đơn đang phục vụ
+                typ, tbl = "takeaway", None
+            else:
+                used.add(tbl)
         path = ["pending", "preparing", "ready", "completed"]
         hist = [{"status": "pending", "at": created}]
         if final == "cancelled":
@@ -139,19 +156,20 @@ def run(n_orders=300, quiet=False):
         batch.append({
             "code": f"CF{created:%y%m%d}{i:04d}", "customerId": c["_id"],
             "customer": {"name": c["name"], "phone": c["phone"]}, "type": typ,
-            "tableNumber": random.randint(1, 20) if typ == "dine_in" else None,
+            "tableNumber": tbl,
             "address": c["addresses"][0] if typ == "delivery" else None,
             "items": lines, "subtotal": subtotal, "shippingFee": ship, "total": total,
             "paymentMethod": random.choice(["cash", "momo", "transfer"]), "note": "",
             "status": final, "statusHistory": hist, "createdAt": created})
     orders.insert_many(batch)
+    tables.update_many({"number": {"$in": list(used)}}, {"$set": {"status": "occupied"}})
     for item_id, q in sold.items():
         menu.update_one({"_id": item_id}, {"$inc": {"sold": q}})
     for cid, p in points.items():
         customers.update_one({"_id": cid}, {"$inc": {"points": p}})
     if not quiet:
         print(f"Xong! categories={categories.count_documents({})} menu_items={menu.count_documents({})} "
-              f"customers={customers.count_documents({})} orders={orders.count_documents({})}")
+              f"customers={customers.count_documents({})} tables={tables.count_documents({})} orders={orders.count_documents({})}")
         print("Database:", database.DB_NAME)
 
 

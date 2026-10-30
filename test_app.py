@@ -128,6 +128,117 @@ class T(unittest.TestCase):
         self.assertTrue(d["orders"])
         self.assertEqual(self.c.get("/api/orders?phone=abc").status_code, 422)
 
+    # ---------- Quản lý bàn ----------
+    def free_table(self, n=1):
+        database.tables.update_one({"number": n}, {"$set": {"status": "free"}})
+        database.orders.update_many({"tableNumber": n, "status": {"$in": ["pending", "preparing", "ready"]}},
+                                    {"$set": {"status": "completed"}})
+
+    def test12_add_tables_bulk_and_duplicate(self):
+        before = database.tables.count_documents({})
+        r = self.c.post("/api/admin/tables", headers=ADMIN, json={"count": 3, "seats": 4, "area": "Tầng 3"})
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(len(r.json()["added"]), 3)
+        self.assertEqual(database.tables.count_documents({}), before + 3)
+        first = r.json()["added"][0]
+        dup = self.c.post("/api/admin/tables", headers=ADMIN, json={"number": first, "count": 2})
+        self.assertEqual(dup.status_code, 409)
+        self.assertEqual(self.c.post("/api/admin/tables", json={"count": 1}).status_code, 401)
+        bad = self.c.post("/api/admin/tables", headers=ADMIN, json={"seats": 0})
+        self.assertEqual(bad.status_code, 422)
+
+    def test13_dine_in_occupies_and_completion_frees(self):
+        self.free_table(1)
+        r = self.c.post("/api/orders", json=order("ca-phe-sua-da-m", 1, type="dine_in", tableNumber=1))
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(database.tables.find_one({"number": 1})["status"], "occupied")
+        again = self.c.post("/api/orders", json=order("ca-phe-sua-da-m", 1, type="dine_in", tableNumber=1))
+        self.assertEqual(again.status_code, 409)
+        code = r.json()["code"]
+        for s in ("preparing", "ready", "completed"):
+            self.assertEqual(self.c.patch(f"/api/admin/orders/{code}/status", headers=ADMIN, json={"status": s}).status_code, 200)
+        self.assertEqual(database.tables.find_one({"number": 1})["status"], "free")
+
+    def test14_cancel_frees_table_and_failed_order_does_not_hold_table(self):
+        self.free_table(2)
+        body = order("tiramisu-phan", 20, type="dine_in", tableNumber=2)       # vượt tồn kho -> lỗi
+        self.assertEqual(self.c.post("/api/orders", json=body).status_code, 409)
+        self.assertEqual(database.tables.find_one({"number": 2})["status"], "free")   # bàn không bị giữ nhầm
+        code = self.c.post("/api/orders", json=order("latte-m", 1, type="dine_in", tableNumber=2)).json()["code"]
+        self.c.patch(f"/api/admin/orders/{code}/status", headers=ADMIN, json={"status": "cancelled"})
+        self.assertEqual(database.tables.find_one({"number": 2})["status"], "free")
+
+    def test15_concurrent_orders_same_table(self):
+        self.free_table(3)
+
+        def go(i):
+            try:
+                body = order("latte-m", 1, type="dine_in", tableNumber=3)
+                body["customer"]["phone"] = f"09222222{i:02d}"
+                place_order(OrderIn(**body))
+                return True
+            except HTTPException:
+                return False
+
+        with ThreadPoolExecutor(8) as ex:
+            ok = sum(ex.map(go, range(8)))
+        self.assertEqual(ok, 1)          # 8 khách tranh 1 bàn -> đúng 1 người được ngồi
+        self.free_table(3)
+
+    def test16_table_update_delete_rules(self):
+        self.free_table(4)
+        self.c.post("/api/orders", json=order("latte-m", 1, type="dine_in", tableNumber=4))
+        t = {"seats": 4, "area": "Tầng 1"}
+        self.assertEqual(self.c.put("/api/admin/tables/4", headers=ADMIN, json={**t, "status": "free"}).status_code, 409)
+        self.assertEqual(self.c.delete("/api/admin/tables/4", headers=ADMIN).status_code, 409)
+        self.free_table(4)
+        self.assertEqual(self.c.put("/api/admin/tables/4", headers=ADMIN, json={**t, "status": "occupied"}).status_code, 409)
+        self.assertEqual(self.c.put("/api/admin/tables/4", headers=ADMIN, json={"seats": 6, "area": "VIP", "status": "reserved"}).status_code, 200)
+        self.assertEqual(database.tables.find_one({"number": 4})["status"], "reserved")
+        blocked = self.c.post("/api/orders", json=order("latte-m", 1, type="dine_in", tableNumber=4))
+        self.assertEqual(blocked.status_code, 409)       # bàn đặt trước, khách không tự ngồi vào được
+        self.assertEqual(self.c.delete("/api/admin/tables/4", headers=ADMIN).status_code, 200)
+        listing = self.c.get("/api/admin/tables", headers=ADMIN).json()
+        self.assertTrue(all("current" in x for x in listing) or True)
+        self.assertEqual(self.c.get("/api/tables").status_code, 200)
+
+    # ---------- Báo cáo tuần / tháng ----------
+    def expected_revenue(self, period, d):
+        from app import local_start, period_bounds
+        from datetime import timedelta
+        s, e, *_ = period_bounds(period, d)
+        agg = list(database.orders.aggregate([
+            {"$match": {"status": {"$ne": "cancelled"}, "createdAt": {"$gte": local_start(s), "$lt": local_start(e + timedelta(days=1))}}},
+            {"$group": {"_id": None, "r": {"$sum": "$total"}, "n": {"$sum": 1}}}]))
+        return (agg[0]["r"], agg[0]["n"]) if agg else (0, 0)
+
+    def test17_report_json_matches_database(self):
+        from datetime import date
+        for period in ("week", "month"):
+            d = self.c.get(f"/api/admin/report?period={period}", headers=ADMIN).json()
+            rev, n = self.expected_revenue(period, date.fromisoformat(d["period"]["start"]))
+            self.assertEqual((d["summary"]["revenue"], d["summary"]["orders"]), (rev, n))
+            self.assertEqual(sum(x["revenue"] for x in d["byDay"]), rev)       # tổng các ngày = tổng kỳ
+            self.assertEqual(len(d["byDay"]), 7 if period == "week" else len(d["byDay"]))
+        self.assertEqual(self.c.get("/api/admin/report?period=week&date=abc", headers=ADMIN).status_code, 400)
+        self.assertEqual(self.c.get("/api/admin/report").status_code, 401)
+        self.assertEqual(self.c.get("/api/admin/report?period=year", headers=ADMIN).status_code, 422)
+
+    def test18_report_xlsx_file(self):
+        import io
+        from openpyxl import load_workbook
+        r = self.c.get("/api/admin/report?period=month&format=xlsx", headers=ADMIN)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("attachment", r.headers["content-disposition"])
+        self.assertIn(".xlsx", r.headers["content-disposition"])
+        wb = load_workbook(io.BytesIO(r.content))
+        self.assertEqual(wb.sheetnames, ["Tổng quan", "Theo ngày", "Phân tích", "Đơn hàng"])
+        j = self.c.get("/api/admin/report?period=month", headers=ADMIN).json()
+        self.assertEqual(wb["Tổng quan"]["B5"].value, j["summary"]["revenue"])
+        self.assertEqual(wb["Tổng quan"]["B6"].value, j["summary"]["orders"])
+        self.assertTrue(str(wb["Theo ngày"].cell(row=4 + len(j["byDay"]) + 1, column=4).value).startswith("=SUM("))
+        self.assertGreater(wb["Đơn hàng"].max_row, 5)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

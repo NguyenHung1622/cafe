@@ -8,7 +8,7 @@ const when = d => new Date(d).toLocaleString('vi-VN', {hour12: false});
 const ST = {pending:'Chờ xác nhận', preparing:'Đang pha chế', ready:'Sẵn sàng', completed:'Hoàn tất', cancelled:'Đã hủy'};
 const TY = {dine_in:'Tại quán', takeaway:'Mang đi', delivery:'Giao hàng'};
 const PAY = {cash:'Tiền mặt', transfer:'Chuyển khoản', momo:'MoMo'};
-let CONFIG = {shippingFee: 15000, freeShipFrom: 150000, tables: 20};
+let CONFIG = {shippingFee: 15000, freeShipFrom: 150000};
 let CATS = [];
 const catColor = id => (CATS.find(c => c._id === id) || {}).color || '#6f4e37';
 const catName = id => (CATS.find(c => c._id === id) || {}).name || id;
@@ -180,10 +180,11 @@ const sendReview = guard(async slug => {
 });
 
 /* ====== Giỏ hàng & thanh toán ====== */
-function cartPage() {
+async function cartPage() {
   const lines = cart.get();
   if (!lines.length) { app.innerHTML = '<div class="card"><h2>Giỏ hàng trống</h2><p><a href="#/"><button>Xem thực đơn</button></a></p></div>'; return; }
   const me = JSON.parse(localStorage.getItem('me') || '{}');
+  const free = (await api('/api/tables').catch(() => [])).filter(t => t.status === 'free');
   app.innerHTML = `<h2>Giỏ hàng</h2><div class="card">${lines.map((l, i) => `
     <div class="cartline"><div class="art">${art(l.category, catColor(l.category), 56)}</div>
       <div style="flex:1"><b>${esc(l.name)}</b> <span class="muted">(${esc(l.size)})</span>
@@ -193,8 +194,8 @@ function cartPage() {
     <div class="card"><h3>Thông tin đặt hàng</h3><div class="form">
       <div><label>Họ tên *</label><input id="cn" value="${esc(me.name || '')}" maxlength="80"></div>
       <div><label>Số điện thoại * (10 số)</label><input id="cp" value="${esc(me.phone || '')}" maxlength="10" inputmode="numeric"></div>
-      <div><label>Hình thức</label><select id="ct" onchange="typeChanged()"><option value="dine_in">Dùng tại quán</option><option value="takeaway">Mang đi</option><option value="delivery">Giao hàng tận nơi</option></select></div>
-      <div id="tblBox"><label>Số bàn</label><select id="ctb">${Array.from({length: CONFIG.tables}, (_, i) => `<option>${i + 1}</option>`).join('')}</select></div>
+      <div><label>Hình thức</label><select id="ct" onchange="typeChanged()">${free.length ? '<option value="dine_in">Dùng tại quán</option>' : ''}<option value="takeaway">Mang đi</option><option value="delivery">Giao hàng tận nơi</option></select></div>
+      <div id="tblBox"><label>Chọn bàn trống</label><select id="ctb">${free.map(t => `<option value="${t.number}">Bàn ${t.number} · ${t.seats} chỗ · ${esc(t.area)}</option>`).join('')}</select></div>
       <div id="adrBox" class="hide"><label>Địa chỉ giao hàng *</label><input id="ca" maxlength="200"></div>
       <div><label>Thanh toán</label><select id="cm"><option value="cash">Tiền mặt</option><option value="transfer">Chuyển khoản</option><option value="momo">MoMo</option></select></div>
       <div style="grid-column:1/-1"><label>Ghi chú cho quán</label><input id="cnote" maxlength="300"></div></div>
@@ -267,9 +268,9 @@ function adminPage() {
     return;
   }
   app.innerHTML = `<div class="row between"><h2>Trang quản trị</h2><button class="sec sm" onclick="sessionStorage.removeItem('adminKey');adminPage()">Đăng xuất</button></div>
-    <div class="tabs">${[['stats', 'Thống kê'], ['orders', 'Đơn hàng'], ['menu', 'Thực đơn']].map(([k, n]) =>
+    <div class="tabs">${[['stats', 'Thống kê'], ['orders', 'Đơn hàng'], ['tables', 'Bàn'], ['menu', 'Thực đơn'], ['report', 'Báo cáo tuần/tháng']].map(([k, n]) =>
       `<span class="chip ${A.tab === k ? 'on' : ''}" onclick="A.tab='${k}';adminPage()">${n}</span>`).join('')}</div><div id="adm"></div>`;
-  return ({stats: adminStats, orders: adminOrders, menu: adminMenu})[A.tab]();
+  return ({stats: adminStats, orders: adminOrders, menu: adminMenu, tables: adminTables, report: adminReport})[A.tab]();
 }
 const adminLogin = guard(async () => {
   sessionStorage.setItem('adminKey', $('#ak').value);
@@ -338,6 +339,98 @@ const saveItem = guard(async () => {
 });
 const toggleItem = guard(async s => { await api(`/api/admin/menu/${s}/toggle`, {method: 'POST'}); adminMenu(); });
 const delItem = guard(async s => { if (confirm('Xóa món này khỏi thực đơn?')) { await api('/api/admin/menu/' + s, {method: 'DELETE'}); adminMenu(); } });
+
+/* ====== Quản lý bàn ====== */
+const TS = {free: 'Trống', occupied: 'Có khách', reserved: 'Đã đặt trước', disabled: 'Tạm ngưng'};
+function tableActions(t) {
+  const n = t.number, b = (label, s, cls = 'sec') => `<button class="${cls} sm" onclick="setTable(${n},'${s}')">${label}</button>`;
+  const by = {free: b('Đặt trước', 'reserved') + b('Tạm ngưng', 'disabled'), reserved: b('Khách đến → Trống', 'free') + b('Tạm ngưng', 'disabled'),
+    disabled: b('Mở lại', 'free'), occupied: `<button class="sec sm" onclick="A.tab='orders';adminPage()">Xem đơn</button>`};
+  return by[t.status] + `<button class="sec sm" onclick="editTable(${n})">Sửa</button>` + (t.status === 'occupied' ? '' : `<button class="bad sm" onclick="delTable(${n})">Xóa</button>`);
+}
+const tableCard = t => `<div class="tbl ${esc(t.status)}"><div class="row between"><b style="font-size:18px">Bàn ${t.number}</b><span class="badge">${TS[t.status]}</span></div>
+  <div class="muted">${t.seats} chỗ ngồi</div>
+  ${t.current ? `<div style="margin:6px 0"><b>${esc(t.current.code)}</b><br><span class="muted">${ST[t.current.status]} · ${fmt(t.current.total)}</span></div>` : ''}
+  <div class="row" style="margin-top:8px">${tableActions(t)}</div></div>`;
+async function adminTables() { await adminCall(async () => {
+  const list = window.ADM_TABLES = await api('/api/admin/tables');
+  const areas = [...new Set(list.map(t => t.area))];
+  $('#adm').innerHTML = `<div class="kpis">${Object.keys(TS).map(s => `<div class="kpi"><span class="muted">${TS[s]}</span><b>${list.filter(t => t.status === s).length}</b></div>`).join('')}</div>
+    <div class="card"><h3>Thêm bàn</h3><div class="form">
+      <div><label>Số bàn bắt đầu (bỏ trống = tự đánh số tiếp)</label><input id="tb_num" type="number" min="1" max="999"></div>
+      <div><label>Số lượng bàn cần thêm</label><input id="tb_cnt" type="number" min="1" max="50" value="1"></div>
+      <div><label>Số chỗ ngồi mỗi bàn</label><input id="tb_seats" type="number" min="1" max="50" value="4"></div>
+      <div><label>Khu vực</label><input id="tb_area" list="areas" value="${esc(areas[0] || 'Tầng 1')}" maxlength="40"><datalist id="areas">${areas.map(a => `<option value="${esc(a)}">`).join('')}</datalist></div></div>
+      <div style="margin-top:10px"><button onclick="addTables()">+ Thêm bàn</button></div></div>
+    ${areas.map(a => `<h3>${esc(a)}</h3><div class="tgrid">${list.filter(t => t.area === a).map(tableCard).join('')}</div>`).join('') || '<div class="card">Chưa có bàn nào.</div>'}`;
+}); }
+const addTables = guard(async () => {
+  const num = $('#tb_num').value;
+  const r = await api('/api/admin/tables', {method: 'POST', body: {number: num ? Number(num) : null, count: Number($('#tb_cnt').value) || 1, seats: Number($('#tb_seats').value) || 4, area: $('#tb_area').value}});
+  toast('Đã thêm bàn ' + r.added.join(', ')); adminTables();
+});
+const setTable = guard(async (n, status) => {
+  const t = ADM_TABLES.find(x => x.number === n);
+  await api('/api/admin/tables/' + n, {method: 'PUT', body: {seats: t.seats, area: t.area, status}}); adminTables();
+});
+const editTable = guard(async n => {
+  const t = ADM_TABLES.find(x => x.number === n);
+  const seats = prompt('Số chỗ ngồi của bàn ' + n, t.seats); if (seats === null) return;
+  const area = prompt('Khu vực', t.area); if (area === null) return;
+  await api('/api/admin/tables/' + n, {method: 'PUT', body: {seats: Number(seats), area, status: t.status}}); toast('Đã cập nhật bàn ' + n); adminTables();
+});
+const delTable = guard(async n => { if (confirm('Xóa bàn ' + n + '?')) { await api('/api/admin/tables/' + n, {method: 'DELETE'}); adminTables(); } });
+
+/* ====== Báo cáo tuần / tháng ====== */
+const R = {type: 'week', date: ''};
+let RPT = null;
+const isoDate = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const change = (cur, prev, label) => (!prev ? '<span class="muted">—</span>' : cur >= prev
+  ? `<span style="color:var(--ok)">▲ ${((cur - prev) / prev * 100).toFixed(1)}%</span>` : `<span style="color:var(--bad)">▼ ${((prev - cur) / prev * 100).toFixed(1)}%</span>`) + ` <span class="muted">so với ${esc(label)}</span>`;
+const rtable = (rows, cols) => `<div class="scroll"><table><tr>${cols.map(c => `<th class="${c[2] || ''}">${c[0]}</th>`).join('')}</tr>${rows.map(r => `<tr>${cols.map(c => `<td class="${c[2] || ''}">${c[1](r)}</td>`).join('')}</tr>`).join('') || '<tr><td>Chưa có dữ liệu</td></tr>'}</table></div>`;
+function rptQuick(type, offset) {
+  const d = new Date();
+  const base = type === 'week' ? new Date(d.getFullYear(), d.getMonth(), d.getDate() + 7 * offset) : new Date(d.getFullYear(), d.getMonth() + offset, 1);
+  R.type = type; R.date = isoDate(base); adminReport();
+}
+async function adminReport() {
+  if (!R.date) R.date = isoDate(new Date());
+  $('#adm').innerHTML = `<div class="card"><h3>Xuất báo cáo doanh thu</h3><div class="row">
+      <button class="sec sm" onclick="rptQuick('week',0)">Tuần này</button><button class="sec sm" onclick="rptQuick('week',-1)">Tuần trước</button>
+      <button class="sec sm" onclick="rptQuick('month',0)">Tháng này</button><button class="sec sm" onclick="rptQuick('month',-1)">Tháng trước</button>
+      <span class="muted">hoặc chọn:</span>
+      <select id="rp_type" onchange="R.type=this.value;loadReport()"><option value="week">Theo tuần</option><option value="month">Theo tháng</option></select>
+      <input id="rp_date" type="date" value="${esc(R.date)}" onchange="R.date=this.value;loadReport()">
+      <button onclick="downloadReport()">⬇ Tải file Excel (.xlsx)</button></div>
+    <p class="muted" style="margin-bottom:0">Chọn một ngày bất kỳ: báo cáo lấy cả tuần (thứ Hai – Chủ nhật) hoặc cả tháng chứa ngày đó. File Excel gồm 4 sheet: Tổng quan, Theo ngày (có biểu đồ), Phân tích, Đơn hàng.</p></div><div id="rp_body"></div>`;
+  $('#rp_type').value = R.type;
+  await loadReport();
+}
+async function loadReport() { await adminCall(async () => {
+  const d = RPT = await api(`/api/admin/report?period=${R.type}&date=${encodeURIComponent(R.date)}`);
+  const s = d.summary, p = d.prev, max = Math.max(1, ...d.byDay.map(x => x.revenue));
+  $('#rp_body').innerHTML = `<h3>${esc(d.period.label)}</h3>
+    <div class="kpis"><div class="kpi"><span class="muted">Doanh thu</span><b>${fmt(s.revenue)}</b>${change(s.revenue, p.revenue, p.label)}</div>
+      <div class="kpi"><span class="muted">Số đơn hợp lệ</span><b>${s.orders}</b>${change(s.orders, p.orders, p.label)}</div>
+      <div class="kpi"><span class="muted">Giá trị đơn trung bình</span><b>${fmt(s.avg)}</b></div>
+      <div class="kpi"><span class="muted">Đơn bị hủy</span><b>${s.cancelled}</b></div>
+      <div class="kpi"><span class="muted">Khách hàng</span><b>${s.customers}</b></div>
+      <div class="kpi"><span class="muted">Số món bán ra</span><b>${s.itemsQty}</b></div></div>
+    <div class="card"><h3>Doanh thu theo ngày</h3><div class="bars" style="margin-bottom:26px">${d.byDay.map(x => `<div class="bar" title="${esc(x.weekday)} ${esc(x.date)}: ${fmt(x.revenue)} · ${x.orders} đơn" style="height:${Math.max(2, x.revenue / max * 100)}%"><span>${esc(x.date.slice(0, 2))}</span></div>`).join('')}</div></div>
+    <div class="cols"><div class="card"><h3>Theo nhóm món</h3>${rtable(d.byCategory, [['Nhóm', r => esc(catName(r._id))], ['SL', r => r.qty, 'num'], ['Doanh thu', r => fmt(r.revenue), 'num']])}</div>
+      <div class="card"><h3>Top 10 món bán chạy</h3>${rtable(d.topItems, [['Món', r => esc(r._id)], ['SL', r => r.qty, 'num'], ['Doanh thu', r => fmt(r.revenue), 'num']])}</div>
+      <div class="card"><h3>Theo hình thức</h3>${rtable(d.byType, [['Hình thức', r => TY[r._id] || esc(r._id)], ['Đơn', r => r.orders, 'num'], ['Doanh thu', r => fmt(r.revenue), 'num']])}</div>
+      <div class="card"><h3>Theo thanh toán</h3>${rtable(d.byPayment, [['Phương thức', r => PAY[r._id] || esc(r._id)], ['Đơn', r => r.orders, 'num'], ['Doanh thu', r => fmt(r.revenue), 'num']])}</div></div>`;
+}); }
+const downloadReport = guard(async () => {
+  const r = await fetch(`/api/admin/report?period=${R.type}&date=${encodeURIComponent(R.date)}&format=xlsx`, {headers: {'X-Admin-Key': sessionStorage.getItem('adminKey') || ''}});
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(typeof d.detail === 'string' ? d.detail : 'Không xuất được báo cáo'); }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(await r.blob());
+  a.download = (RPT ? RPT.period.filename : 'bao-cao') + '.xlsx';
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  toast('Đã tải file báo cáo ✔');
+});
 
 /* ====== Khởi động ====== */
 (async function init() {

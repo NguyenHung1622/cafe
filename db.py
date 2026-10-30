@@ -16,6 +16,7 @@ categories = db.categories
 menu = db.menu_items
 customers = db.customers
 orders = db.orders
+tables = db.tables
 
 NUM = ["int", "long", "double"]
 MENU_SCHEMA = {"$jsonSchema": {
@@ -44,6 +45,17 @@ ORDER_SCHEMA = {"$jsonSchema": {
 }}
 
 
+TABLE_SCHEMA = {"$jsonSchema": {
+    "bsonType": "object",
+    "required": ["number", "seats", "status"],
+    "properties": {
+        "number": {"bsonType": ["int", "long"], "minimum": 1},
+        "seats": {"bsonType": ["int", "long"], "minimum": 1, "maximum": 50},
+        "status": {"enum": ["free", "occupied", "reserved", "disabled"]},
+    },
+}}
+
+
 def slugify(s: str) -> str:
     s = s.replace("đ", "d").replace("Đ", "D")
     s = unicodedata.normalize("NFD", s)
@@ -58,6 +70,8 @@ def ensure_schema():
         db.create_collection("menu_items", validator=MENU_SCHEMA)
     if "orders" not in existing:
         db.create_collection("orders", validator=ORDER_SCHEMA)
+    if "tables" not in existing:
+        db.create_collection("tables", validator=TABLE_SCHEMA)
 
     menu.create_index("slug", unique=True, name="slug_unique")
     menu.create_index("variants.sku", unique=True, name="sku_unique")          # multikey
@@ -70,9 +84,11 @@ def ensure_schema():
     orders.create_index("code", unique=True, name="code_unique")
     orders.create_index([("customerId", ASCENDING), ("createdAt", DESCENDING)], name="customer_recent")
     orders.create_index([("status", ASCENDING), ("createdAt", DESCENDING)], name="status_recent")
+    orders.create_index([("tableNumber", ASCENDING), ("status", ASCENDING)], name="table_status")
+    tables.create_index("number", unique=True, name="number_unique")
 
 
 def reset():
-    for c in ["categories", "menu_items", "customers", "orders"]:
+    for c in ["categories", "menu_items", "customers", "orders", "tables"]:
         db.drop_collection(c)
     ensure_schema()
